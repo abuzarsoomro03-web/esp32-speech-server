@@ -52,24 +52,69 @@ class AzureSpeechBridge:
             logger.error(f"❌ Failed to initialize Azure Speech SDK: {e}")
             raise
         
-    async def start_continuous_recognition_aiohttp(self, websocket):
-        """Handle continuous real-time speech recognition for aiohttp websocket"""
-        try:
-            # Create audio stream format
-            audio_format = speechsdk.audio.AudioStreamFormat(
-                samples_per_second=SAMPLE_RATE,
-                bits_per_sample=16,
-                channels=CHANNELS
-            )
-            
-            # Create push stream with proper format
-            stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
-            audio_config = speechsdk.audio.AudioConfig(stream=stream)
-            
-            recognizer = speechsdk.SpeechRecognizer(
-                speech_config=self.speech_config,
-                audio_config=audio_config
-            )
+   # Replace the start_continuous_recognition_aiohttp function with this:
+
+async def start_continuous_recognition_aiohttp(self, websocket):
+    """Handle continuous real-time speech recognition for aiohttp websocket"""
+    try:
+        # DON'T create format - use default for raw PCM 16kHz mono 16-bit
+        stream = speechsdk.audio.PushAudioInputStream()
+        audio_config = speechsdk.audio.AudioConfig(stream=stream)
+        
+        recognizer = speechsdk.SpeechRecognizer(
+            speech_config=self.speech_config,
+            audio_config=audio_config
+        )
+        
+        # Handle session events
+        def on_session_started(evt):
+            logger.info("🎤 Azure recognition session STARTED")
+        
+        def on_session_stopped(evt):
+            logger.warning("🛑 Azure recognition session STOPPED")
+        
+        # Handle recognized speech (final results)
+        def on_recognized(evt):
+            if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+                text = evt.result.text
+                if text.strip():
+                    logger.info(f"✓ RECOGNIZED: {text}")
+                    asyncio.create_task(
+                        websocket.send_json({"text": text, "final": True})
+                    )
+            elif evt.result.reason == speechsdk.ResultReason.NoMatch:
+                logger.warning("⚠️  No speech recognized (NoMatch)")
+        
+        # Handle partial results
+        def on_recognizing(evt):
+            if evt.result.reason == speechsdk.ResultReason.RecognizingSpeech:
+                text = evt.result.text
+                if text.strip():
+                    logger.info(f"→ Recognizing: {text}")
+                    asyncio.create_task(
+                        websocket.send_json({"text": text, "final": False})
+                    )
+        
+        # Handle errors
+        def on_canceled(evt):
+            if evt.reason == speechsdk.CancellationReason.Error:
+                logger.error(f"❌ Recognition error: {evt.error_details}")
+        
+        # Connect all event handlers
+        recognizer.session_started.connect(on_session_started)
+        recognizer.session_stopped.connect(on_session_stopped)
+        recognizer.recognized.connect(on_recognized)
+        recognizer.recognizing.connect(on_recognizing)
+        recognizer.canceled.connect(on_canceled)
+        
+        # WAIT for first audio chunk before starting recognition
+        logger.info("⏳ Waiting for audio data before starting Azure session...")
+        
+        return recognizer, stream, False  # Return False to indicate "not started yet"
+        
+    except Exception as e:
+        logger.error(f"❌ Recognition setup error: {e}", exc_info=True)
+        return None, None, False
             
             # Handle session events
             def on_session_started(evt):
@@ -373,13 +418,14 @@ async def handle_websocket_upgrade(request):
     
     recognizer = None
     stream = None
+    recognition_started = False
     
     try:
-        # Start continuous recognition
-        recognizer, stream = await bridge.start_continuous_recognition_aiohttp(ws)
+        # Setup recognition (but don't start yet)
+        recognizer, stream, _ = await bridge.start_continuous_recognition_aiohttp(ws)
         
         if not recognizer or not stream:
-            logger.error("❌ Failed to start recognition")
+            logger.error("❌ Failed to setup recognition")
             return ws
         
         # Track stats
@@ -395,6 +441,11 @@ async def handle_websocket_upgrade(request):
                     logger.info(f"📦 First audio chunk: {len(msg.data)} bytes")
                     logger.info(f"   Sample (hex): {msg.data[:16].hex()}")
                     first_chunk = False
+                    
+                    # NOW start recognition after we have audio
+                    recognizer.start_continuous_recognition()
+                    recognition_started = True
+                    logger.info("✓ Azure recognition started with audio data")
                 
                 stream.write(msg.data)
                 total_bytes += len(msg.data)
@@ -440,7 +491,7 @@ async def handle_websocket_upgrade(request):
         logger.error(f"❌ Unexpected error: {e}", exc_info=True)
     finally:
         # Cleanup
-        if recognizer:
+        if recognizer and recognition_started:
             try:
                 recognizer.stop_continuous_recognition()
             except:
