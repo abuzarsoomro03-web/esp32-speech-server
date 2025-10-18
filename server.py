@@ -36,61 +36,60 @@ class AzureSpeechBridge:
         logger.info(f"Azure Speech SDK initialized (Region: {AZURE_REGION})")
     
     async def start_continuous_recognition_aiohttp(self, websocket):
-    try:
-        # Explicitly configure audio format
-        audio_format = speechsdk.audio.AudioStreamFormat(
-            samples_per_second=16000,
-            bits_per_sample=16,
-            channels=1
-        )
-        
-        stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
-        audio_config = speechsdk.audio.AudioConfig(stream=stream)
-        
-        recognizer = speechsdk.SpeechRecognizer(
-            speech_config=self.speech_config,
-            audio_config=audio_config
-        )
-        
-        def on_session_started(evt):
-            logger.info("Azure session STARTED")
-        
-        def on_session_stopped(evt):
-            logger.warning("Azure session STOPPED")
-        
-        def on_recognized(evt):
-            logger.info(f"Recognition event: {evt.result.reason}")
-            if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
-                text = evt.result.text
-                logger.info(f"RECOGNIZED: {text}")
-                asyncio.create_task(
-                    websocket.send_json({"text": text, "final": True})
-                )
-            elif evt.result.reason == speechsdk.ResultReason.NoMatch:
-                logger.warning("NoMatch - no speech detected")
-        
-        def on_recognizing(evt):
-            if evt.result.reason == speechsdk.ResultReason.RecognizingSpeech:
-                text = evt.result.text
-                logger.info(f"Recognizing: {text}")
-                asyncio.create_task(
-                    websocket.send_json({"text": text, "final": False})
-                )
-        
-        def on_canceled(evt):
-            logger.error(f"Canceled: {evt.reason} - {evt.error_details if evt.reason == speechsdk.CancellationReason.Error else ''}")
-        
-        recognizer.session_started.connect(on_session_started)
-        recognizer.session_stopped.connect(on_session_stopped)
-        recognizer.recognized.connect(on_recognized)
-        recognizer.recognizing.connect(on_recognizing)
-        recognizer.canceled.connect(on_canceled)
-        
-        return recognizer, stream
-        
-    except Exception as e:
-        logger.error(f"Recognition setup error: {e}")
-        return None, None
+        try:
+            audio_format = speechsdk.audio.AudioStreamFormat(
+                samples_per_second=16000,
+                bits_per_sample=16,
+                channels=1
+            )
+            
+            stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
+            audio_config = speechsdk.audio.AudioConfig(stream=stream)
+            
+            recognizer = speechsdk.SpeechRecognizer(
+                speech_config=self.speech_config,
+                audio_config=audio_config
+            )
+            
+            def on_session_started(evt):
+                logger.info("Azure session STARTED")
+            
+            def on_session_stopped(evt):
+                logger.warning("Azure session STOPPED")
+            
+            def on_recognized(evt):
+                logger.info(f"Recognition event: {evt.result.reason}")
+                if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+                    text = evt.result.text
+                    logger.info(f"RECOGNIZED: {text}")
+                    asyncio.create_task(
+                        websocket.send_json({"text": text, "final": True})
+                    )
+                elif evt.result.reason == speechsdk.ResultReason.NoMatch:
+                    logger.warning("NoMatch - no speech detected")
+            
+            def on_recognizing(evt):
+                if evt.result.reason == speechsdk.ResultReason.RecognizingSpeech:
+                    text = evt.result.text
+                    logger.info(f"Recognizing: {text}")
+                    asyncio.create_task(
+                        websocket.send_json({"text": text, "final": False})
+                    )
+            
+            def on_canceled(evt):
+                logger.error(f"Canceled: {evt.reason} - {evt.error_details if evt.reason == speechsdk.CancellationReason.Error else ''}")
+            
+            recognizer.session_started.connect(on_session_started)
+            recognizer.session_stopped.connect(on_session_stopped)
+            recognizer.recognized.connect(on_recognized)
+            recognizer.recognizing.connect(on_recognizing)
+            recognizer.canceled.connect(on_canceled)
+            
+            return recognizer, stream
+            
+        except Exception as e:
+            logger.error(f"Recognition setup error: {e}")
+            return None, None
     
     def text_to_speech(self, text: str) -> bytes:
         try:
