@@ -52,7 +52,76 @@ class AzureSpeechBridge:
             logger.error(f"❌ Failed to initialize Azure Speech SDK: {e}")
             raise
         
-    async def start_continuous_recognition(self, websocket):
+    async def start_continuous_recognition_aiohttp(self, websocket):
+        """Handle continuous real-time speech recognition for aiohttp websocket"""
+        try:
+            # Create audio stream format
+            audio_format = speechsdk.audio.AudioStreamFormat(
+                samples_per_second=SAMPLE_RATE,
+                bits_per_sample=16,
+                channels=CHANNELS
+            )
+            
+            # Create push stream with proper format
+            stream = speechsdk.audio.PushAudioInputStream(audio_format)
+            audio_config = speechsdk.audio.AudioConfig(stream=stream)
+            
+            recognizer = speechsdk.SpeechRecognizer(
+                speech_config=self.speech_config,
+                audio_config=audio_config
+            )
+            
+            # Handle session events
+            def on_session_started(evt):
+                logger.info("🎤 Azure recognition session STARTED")
+            
+            def on_session_stopped(evt):
+                logger.warning("🛑 Azure recognition session STOPPED")
+            
+            # Handle recognized speech (final results)
+            def on_recognized(evt):
+                if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+                    text = evt.result.text
+                    if text.strip():
+                        logger.info(f"✓ RECOGNIZED: {text}")
+                        asyncio.create_task(
+                            websocket.send_json({"text": text, "final": True})
+                        )
+                elif evt.result.reason == speechsdk.ResultReason.NoMatch:
+                    logger.warning("⚠️  No speech recognized (NoMatch)")
+            
+            # Handle partial results
+            def on_recognizing(evt):
+                if evt.result.reason == speechsdk.ResultReason.RecognizingSpeech:
+                    text = evt.result.text
+                    if text.strip():
+                        logger.info(f"→ Recognizing: {text}")
+                        asyncio.create_task(
+                            websocket.send_json({"text": text, "final": False})
+                        )
+            
+            # Handle errors
+            def on_canceled(evt):
+                if evt.reason == speechsdk.CancellationReason.Error:
+                    logger.error(f"❌ Recognition error: {evt.error_details}")
+            
+            # Connect all event handlers
+            recognizer.session_started.connect(on_session_started)
+            recognizer.session_stopped.connect(on_session_stopped)
+            recognizer.recognized.connect(on_recognized)
+            recognizer.recognizing.connect(on_recognizing)
+            recognizer.canceled.connect(on_canceled)
+            
+            # Start continuous recognition
+            recognizer.start_continuous_recognition()
+            logger.info("✓ Continuous recognition started")
+            
+            return recognizer, stream
+            
+        except Exception as e:
+            logger.error(f"❌ Recognition setup error: {e}", exc_info=True)
+            return None, None
+    
         """Handle continuous real-time speech recognition"""
         try:
             # Create audio stream format
@@ -288,15 +357,102 @@ async def handle_client(websocket, path):
                 pass
         logger.info(f"🔒 Connection closed: {client_ip}")
 
-async def start_websocket_server():
-    """Start WebSocket server on /ws path"""
-    # Use a different port for WebSocket
-    ws_port = WS_PORT + 1
+# ============================================
+# Combined Server (HTTP + WebSocket on same port)
+# ============================================
+
+async def handle_websocket_upgrade(request):
+    """Handle WebSocket upgrade requests"""
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
     
-    async with serve(handle_client, WS_HOST, ws_port):
-        logger.info(f"✓ WebSocket server ready on port {ws_port}")
-        logger.info(f"   Connect to: ws://localhost:{ws_port}/")
-        await asyncio.Future()
+    client_ip = request.remote
+    logger.info(f"{'='*70}")
+    logger.info(f"🔌 ESP32 CONNECTED from {client_ip}")
+    logger.info(f"{'='*70}")
+    
+    recognizer = None
+    stream = None
+    
+    try:
+        # Start continuous recognition
+        recognizer, stream = await bridge.start_continuous_recognition_aiohttp(ws)
+        
+        if not recognizer or not stream:
+            logger.error("❌ Failed to start recognition")
+            return ws
+        
+        # Track stats
+        total_bytes = 0
+        chunk_count = 0
+        last_log_time = asyncio.get_event_loop().time()
+        first_chunk = True
+        
+        async for msg in ws:
+            if msg.type == web.WSMsgType.BINARY:
+                # Audio data
+                if first_chunk:
+                    logger.info(f"📦 First audio chunk: {len(msg.data)} bytes")
+                    logger.info(f"   Sample (hex): {msg.data[:16].hex()}")
+                    first_chunk = False
+                
+                stream.write(msg.data)
+                total_bytes += len(msg.data)
+                chunk_count += 1
+                
+                # Log stats every 2 seconds
+                current_time = asyncio.get_event_loop().time()
+                if current_time - last_log_time >= 2.0:
+                    elapsed = current_time - last_log_time
+                    bytes_per_sec = total_bytes / elapsed if elapsed > 0 else 0
+                    duration_sec = total_bytes / (SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH)
+                    
+                    logger.info(f"📊 Audio: {chunk_count} chunks | {total_bytes} bytes | "
+                              f"{bytes_per_sec:.0f} B/s | {duration_sec:.1f}s")
+                    
+                    expected_rate = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH
+                    if bytes_per_sec < expected_rate * 0.5:
+                        logger.warning(f"⚠️  Low data rate! Expected ~{expected_rate} B/s")
+                    
+                    total_bytes = 0
+                    chunk_count = 0
+                    last_log_time = current_time
+                    
+            elif msg.type == web.WSMsgType.TEXT:
+                # TTS request
+                try:
+                    data = json.loads(msg.data)
+                    text = data.get("text", "")
+                    
+                    if text:
+                        logger.info(f"📤 TTS Request: '{text}'")
+                        audio = bridge.text_to_speech(text)
+                        if audio:
+                            await ws.send_bytes(audio)
+                            logger.info(f"📥 TTS audio sent: {len(audio)} bytes")
+                except json.JSONDecodeError:
+                    logger.error(f"❌ Invalid JSON received")
+                    
+            elif msg.type == web.WSMsgType.ERROR:
+                logger.error(f"❌ WebSocket error: {ws.exception()}")
+                
+    except Exception as e:
+        logger.error(f"❌ Unexpected error: {e}", exc_info=True)
+    finally:
+        # Cleanup
+        if recognizer:
+            try:
+                recognizer.stop_continuous_recognition()
+            except:
+                pass
+        if stream:
+            try:
+                stream.close()
+            except:
+                pass
+        logger.info(f"🔒 Connection closed: {client_ip}")
+    
+    return ws
 
 # ============================================
 # Main Server
@@ -313,20 +469,29 @@ async def main():
     logger.info(f"   Environment: {'Render' if os.environ.get('RENDER') else 'Local'}")
     logger.info("=" * 70)
     
-    # Start HTTP server (handles health checks and bots)
-    http_runner = await start_http_server()
+    # Create app with both HTTP and WebSocket
+    app = web.Application()
+    app.router.add_get('/health', http_health)
+    app.router.add_get('/', http_root)
+    app.router.add_get('/ws', handle_websocket_upgrade)
     
-    # Start WebSocket server on different port
-    ws_task = asyncio.create_task(start_websocket_server())
+    runner = web.AppRunner(app)
+    await runner.setup()
     
+    site = web.TCPSite(runner, WS_HOST, WS_PORT)
+    await site.start()
+    
+    logger.info(f"✓ Server ready on port {WS_PORT}")
+    logger.info(f"   HTTP: http://localhost:{WS_PORT}/")
+    logger.info(f"   WebSocket: ws://localhost:{WS_PORT}/ws")
     logger.info("=" * 70)
-    logger.info("✅ All servers running - Ready for connections")
+    logger.info("✅ Ready for connections")
     logger.info("=" * 70)
     
     try:
-        await ws_task
+        await asyncio.Future()
     finally:
-        await http_runner.cleanup()
+        await runner.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())
