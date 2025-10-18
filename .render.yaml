@@ -1,8 +1,18 @@
 services:
+
   - type: web
+
     name: esp32-speech-server
+
     env: node
+
     plan: free
+
     region: singapore
+
     buildCommand: "npm install"
+
     startCommand: "npm start"
+
+Change this .ymal file for below code
+
