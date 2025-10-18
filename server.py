@@ -63,7 +63,7 @@ class AzureSpeechBridge:
             )
             
             # Create push stream with proper format
-            stream = speechsdk.audio.PushAudioInputStream(audio_format)
+            stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
             audio_config = speechsdk.audio.AudioConfig(stream=stream)
             
             recognizer = speechsdk.SpeechRecognizer(
