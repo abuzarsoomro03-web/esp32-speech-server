@@ -8,9 +8,13 @@ import os
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Azure Configuration - Use environment variables
-AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "8mcyBrjamERcKLJYtHX8jFXdNEqfG41J8ZyxAEUZ06hJDIN2eT3DJQQJ99BGACqBBLyXJ3w3AAAYACOGBxgb")
+# Azure Configuration - ONLY use environment variables
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 AZURE_REGION = os.getenv("AZURE_REGION", "southeastasia")
+
+# Validate required environment variables
+if not AZURE_SPEECH_KEY:
+    raise ValueError("AZURE_SPEECH_KEY environment variable is required!")
 
 # Server Configuration - Railway provides PORT env variable
 WS_HOST = "0.0.0.0"
