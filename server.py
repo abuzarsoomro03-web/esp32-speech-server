@@ -105,6 +105,13 @@ class AzureSpeechBridge:
             recognizer.start_continuous_recognition()
             logger.info("✓ Continuous recognition started - waiting for audio...")
             
+            # NEW: Send a small warmup packet to keep Azure alive initially
+            # This prevents Azure from timing out if ESP32 takes a moment to start streaming
+            await asyncio.sleep(0.1)
+            silence = bytes([0] * 320)  # 10ms of silence at 16kHz
+            stream.write(silence)
+            logger.info("   Sent warmup packet to Azure")
+            
             return recognizer, stream
             
         except Exception as e:
@@ -142,6 +149,10 @@ async def handle_client(websocket):
     stream = None
     
     try:
+        # NEW: Small delay to let WebSocket fully establish
+        await asyncio.sleep(0.5)
+        logger.info("   WebSocket connection stabilized")
+        
         # Start continuous recognition
         recognizer, stream = await bridge.start_continuous_recognition(websocket)
         
@@ -154,6 +165,7 @@ async def handle_client(websocket):
         chunk_count = 0
         last_log_time = asyncio.get_event_loop().time()
         first_chunk = True
+        audio_received = False  # NEW: Track if we've received ANY audio
         
         async for message in websocket:
             # Binary = Audio chunks for STT (ESP32 → Azure)
@@ -164,6 +176,7 @@ async def handle_client(websocket):
                     logger.info(f"   Preview (hex): {message[:16].hex()}")
                     logger.info(f"   Preview (decimal): {list(message[:8])}")
                     first_chunk = False
+                    audio_received = True
                 
                 # Feed audio chunk to Azure stream
                 stream.write(message)
@@ -206,6 +219,11 @@ async def handle_client(websocket):
                             logger.error("TTS failed to generate audio")
                 except json.JSONDecodeError:
                     logger.error(f"Invalid JSON: {message}")
+        
+        # NEW: Log if we never received audio
+        if not audio_received:
+            logger.warning("⚠️  Connection closed but NO AUDIO was ever received!")
+            logger.warning("   Check ESP32 microphone and audio streaming code")
                     
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"═══ ESP32 disconnected: {client_ip} ═══")
