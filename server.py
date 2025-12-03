@@ -1,9 +1,10 @@
 import asyncio
 import websockets
 import json
-import aiohttp
+import azure.cognitiveservices.speech as speechsdk
 import logging
 import os
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,131 +27,200 @@ SAMPLE_WIDTH = 2  # 16-bit
 
 class AzureSpeechBridge:
     def __init__(self):
-        self.speech_key = AZURE_SPEECH_KEY
-        self.region = AZURE_REGION
+        self.speech_config = speechsdk.SpeechConfig(
+            subscription=AZURE_SPEECH_KEY,
+            region=AZURE_REGION
+        )
+        self.speech_config.speech_recognition_language = "en-US"
         
-    async def recognize_continuous(self, websocket, audio_buffer):
-        """
-        Use Azure REST API for speech recognition instead of SDK
-        This avoids Railway firewall issues with SDK's internal WebSocket
-        """
-        url = f"https://{self.region}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1"
+        # CRITICAL: Set properties to prevent timeout
+        self.speech_config.set_property(
+            speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "3000"
+        )
+        self.speech_config.set_property(
+            speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "10000"
+        )
+        self.speech_config.set_property(
+            speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "3000"
+        )
         
-        params = {
-            "language": "en-US",
-            "format": "detailed"
-        }
-        
-        headers = {
-            "Ocp-Apim-Subscription-Key": self.speech_key,
-            "Content-Type": "audio/wav; codec=audio/pcm; samplerate=16000",
-            "Accept": "application/json"
-        }
-        
+    async def start_continuous_recognition(self, websocket):
+        """Handle continuous real-time speech recognition"""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, params=params, headers=headers, data=audio_buffer) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        
-                        # Extract recognized text
-                        if "NBest" in result and len(result["NBest"]) > 0:
-                            text = result["NBest"][0]["Display"]
-                            logger.info(f"✓ RECOGNIZED: {text}")
-                            
-                            await websocket.send(json.dumps({
-                                "text": text,
-                                "final": True
-                            }))
-                            return text
-                        else:
-                            logger.warning("⚠️  No speech recognized")
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"Azure API error {response.status}: {error_text}")
-                        
+            # Create audio stream format
+            audio_format = speechsdk.audio.AudioStreamFormat(
+                samples_per_second=SAMPLE_RATE,
+                bits_per_sample=16,
+                channels=CHANNELS
+            )
+            
+            # Create push stream
+            stream = speechsdk.audio.PushAudioInputStream(audio_format)
+            audio_config = speechsdk.audio.AudioConfig(stream=stream)
+            
+            recognizer = speechsdk.SpeechRecognizer(
+                speech_config=self.speech_config,
+                audio_config=audio_config
+            )
+            
+            # Get event loop
+            loop = asyncio.get_running_loop()
+            
+            # Track recognition state
+            recognition_active = {"value": False}
+            
+            # Handle session events
+            def on_session_started(evt):
+                logger.info("🎤 Azure recognition session STARTED")
+                recognition_active["value"] = True
+            
+            def on_session_stopped(evt):
+                logger.warning("🛑 Azure recognition session STOPPED")
+                recognition_active["value"] = False
+            
+            # Handle recognized speech (final results)
+            def on_recognized(evt):
+                if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+                    text = evt.result.text
+                    if text.strip():
+                        logger.info(f"✓ RECOGNIZED: {text}")
+                        asyncio.run_coroutine_threadsafe(
+                            websocket.send(json.dumps({"text": text, "final": True})),
+                            loop
+                        )
+                elif evt.result.reason == speechsdk.ResultReason.NoMatch:
+                    logger.debug("No speech in this segment")
+            
+            # Handle partial results (real-time feedback)
+            def on_recognizing(evt):
+                if evt.result.reason == speechsdk.ResultReason.RecognizingSpeech:
+                    text = evt.result.text
+                    if text.strip():
+                        logger.info(f"→ Recognizing: {text}")
+                        asyncio.run_coroutine_threadsafe(
+                            websocket.send(json.dumps({"text": text, "final": False})),
+                            loop
+                        )
+            
+            # Handle errors
+            def on_canceled(evt):
+                if evt.reason == speechsdk.CancellationReason.Error:
+                    logger.error(f"❌ Recognition error: {evt.error_details}")
+                    logger.error(f"   Error code: {evt.cancellation_details.error_code}")
+                    recognition_active["value"] = False
+            
+            # Connect all event handlers
+            recognizer.session_started.connect(on_session_started)
+            recognizer.session_stopped.connect(on_session_stopped)
+            recognizer.recognized.connect(on_recognized)
+            recognizer.recognizing.connect(on_recognizing)
+            recognizer.canceled.connect(on_canceled)
+            
+            # Start continuous recognition
+            recognizer.start_continuous_recognition()
+            logger.info("✓ Starting continuous recognition...")
+            
+            # Wait for session to actually start (max 5 seconds)
+            start_wait = time.time()
+            while not recognition_active["value"] and (time.time() - start_wait) < 5:
+                await asyncio.sleep(0.1)
+            
+            if recognition_active["value"]:
+                logger.info("✓ Recognition session confirmed active!")
+            else:
+                logger.warning("⚠️  Recognition session didn't start in time")
+            
+            return recognizer, stream, recognition_active
+            
         except Exception as e:
-            logger.error(f"Recognition error: {e}", exc_info=True)
-        
-        return None
+            logger.error(f"Recognition setup error: {e}", exc_info=True)
+            return None, None, None
     
-    async def text_to_speech(self, text: str) -> bytes:
-        """Convert text to speech using REST API"""
-        url = f"https://{self.region}.tts.speech.microsoft.com/cognitiveservices/v1"
-        
-        headers = {
-            "Ocp-Apim-Subscription-Key": self.speech_key,
-            "Content-Type": "application/ssml+xml",
-            "X-Microsoft-OutputFormat": "riff-16khz-16bit-mono-pcm",
-            "User-Agent": "ESP32-TTS-Client"
-        }
-        
-        ssml = f"""<speak version='1.0' xml:lang='en-US'>
-            <voice name='en-US-AriaNeural'>
-                {text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')}
-            </voice>
-        </speak>"""
-        
+    def text_to_speech(self, text: str) -> bytes:
+        """Convert text to speech audio"""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, data=ssml) as response:
-                    if response.status == 200:
-                        audio_data = await response.read()
-                        logger.info(f"✓ TTS completed: {len(audio_data)} bytes")
-                        return audio_data
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"TTS error {response.status}: {error_text}")
+            synthesizer = speechsdk.SpeechSynthesizer(
+                speech_config=self.speech_config,
+                audio_config=None
+            )
+            result = synthesizer.speak_text_async(text).get()
+            
+            if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                logger.info(f"✓ TTS completed: {len(result.audio_data)} bytes")
+                return result.audio_data
+            else:
+                logger.error(f"TTS failed: {result.reason}")
+            return None
+            
         except Exception as e:
             logger.error(f"TTS Error: {e}")
-        
-        return None
+            return None
 
 bridge = AzureSpeechBridge()
 
 async def handle_client(websocket):
-    """Handle ESP32 connection"""
+    """Handle ESP32 connection with bidirectional communication"""
     client_ip = websocket.remote_address[0]
     logger.info(f"═══ ESP32 connected: {client_ip} ═══")
     
+    recognizer = None
+    stream = None
+    recognition_active = None
+    
     try:
+        # Start continuous recognition
+        recognizer, stream, recognition_active = await bridge.start_continuous_recognition(websocket)
+        
+        if not recognizer or not stream:
+            logger.error("Failed to start recognition")
+            return
+        
         # Track stats
-        audio_buffer = bytearray()
+        total_bytes = 0
         chunk_count = 0
-        last_recognition_time = asyncio.get_event_loop().time()
-        recognition_interval = 3.0  # Recognize every 3 seconds of audio
+        last_log_time = asyncio.get_event_loop().time()
+        first_chunk = True
+        last_audio_time = time.time()
         
         async for message in websocket:
-            # Binary = Audio chunks
+            # Binary = Audio chunks for STT (ESP32 → Azure)
             if isinstance(message, bytes):
-                audio_buffer.extend(message)
-                chunk_count += 1
+                # Debug first chunk
+                if first_chunk:
+                    logger.info(f"📦 First chunk received: {len(message)} bytes")
+                    logger.info(f"   Preview (hex): {message[:16].hex()}")
+                    first_chunk = False
                 
-                # Calculate audio duration
-                buffer_duration = len(audio_buffer) / (SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH)
-                current_time = asyncio.get_event_loop().time()
-                
-                # Recognize every N seconds of audio
-                if buffer_duration >= recognition_interval:
-                    logger.info(f"📦 Buffered {buffer_duration:.1f}s ({len(audio_buffer)} bytes)")
-                    logger.info("   Sending to Azure REST API...")
-                    
-                    # Create WAV header for the audio
-                    wav_data = create_wav(audio_buffer, SAMPLE_RATE, CHANNELS, SAMPLE_WIDTH)
-                    
-                    # Send to Azure
-                    await bridge.recognize_continuous(websocket, wav_data)
-                    
-                    # Clear buffer for next segment
-                    audio_buffer.clear()
-                    chunk_count = 0
-                    last_recognition_time = current_time
+                # Feed audio chunk to Azure stream
+                if stream:
+                    stream.write(message)
+                    total_bytes += len(message)
+                    chunk_count += 1
+                    last_audio_time = time.time()
                 
                 # Log stats every 2 seconds
-                if current_time - last_recognition_time >= 2.0 and len(audio_buffer) > 0:
-                    logger.info(f"📊 Buffering: {chunk_count} chunks | {len(audio_buffer)} bytes | {buffer_duration:.1f}s audio")
+                current_time = asyncio.get_event_loop().time()
+                if current_time - last_log_time >= 2.0:
+                    elapsed = current_time - last_log_time
+                    bytes_per_sec = total_bytes / elapsed if elapsed > 0 else 0
+                    duration_sec = total_bytes / (SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH)
+                    
+                    status = "🟢 ACTIVE" if recognition_active["value"] else "🔴 STOPPED"
+                    logger.info(f"📊 {status} | {chunk_count} chunks | {total_bytes} bytes | "
+                              f"{bytes_per_sec:.0f} B/s | {duration_sec:.1f}s audio")
+                    
+                    # Check if recognition stopped unexpectedly
+                    if not recognition_active["value"]:
+                        logger.warning("⚠️  Recognition stopped! Restarting...")
+                        recognizer.stop_continuous_recognition()
+                        await asyncio.sleep(0.5)
+                        recognizer.start_continuous_recognition()
+                    
+                    total_bytes = 0
+                    chunk_count = 0
+                    last_log_time = current_time
             
-            # JSON = TTS request
+            # JSON = Text for TTS (ESP32 → Azure → ESP32)
             else:
                 try:
                     data = json.loads(message)
@@ -158,61 +228,45 @@ async def handle_client(websocket):
                     
                     if text:
                         logger.info(f"📤 TTS Request: '{text}'")
-                        audio = await bridge.text_to_speech(text)
+                        
+                        audio = bridge.text_to_speech(text)
                         if audio:
                             await websocket.send(audio)
-                            logger.info(f"📥 Sent TTS audio: {len(audio)} bytes")
+                            logger.info(f"📥 Sent TTS audio to ESP32: {len(audio)} bytes")
+                        else:
+                            logger.error("TTS failed to generate audio")
                 except json.JSONDecodeError:
                     logger.error(f"Invalid JSON: {message}")
-        
-        # Process any remaining audio
-        if len(audio_buffer) > 0:
-            logger.info(f"Processing final {len(audio_buffer)} bytes...")
-            wav_data = create_wav(audio_buffer, SAMPLE_RATE, CHANNELS, SAMPLE_WIDTH)
-            await bridge.recognize_continuous(websocket, wav_data)
                     
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"═══ ESP32 disconnected: {client_ip} ═══")
     except Exception as e:
         logger.error(f"❌ Error: {e}", exc_info=True)
-
-def create_wav(audio_data, sample_rate, channels, sample_width):
-    """Create WAV file from raw PCM data"""
-    import struct
-    
-    # WAV file header
-    wav_header = bytearray()
-    
-    # RIFF chunk
-    wav_header.extend(b'RIFF')
-    wav_header.extend(struct.pack('<I', len(audio_data) + 36))  # File size - 8
-    wav_header.extend(b'WAVE')
-    
-    # fmt chunk
-    wav_header.extend(b'fmt ')
-    wav_header.extend(struct.pack('<I', 16))  # fmt chunk size
-    wav_header.extend(struct.pack('<H', 1))   # PCM format
-    wav_header.extend(struct.pack('<H', channels))
-    wav_header.extend(struct.pack('<I', sample_rate))
-    wav_header.extend(struct.pack('<I', sample_rate * channels * sample_width))  # Byte rate
-    wav_header.extend(struct.pack('<H', channels * sample_width))  # Block align
-    wav_header.extend(struct.pack('<H', sample_width * 8))  # Bits per sample
-    
-    # data chunk
-    wav_header.extend(b'data')
-    wav_header.extend(struct.pack('<I', len(audio_data)))
-    
-    return bytes(wav_header + audio_data)
+    finally:
+        # Cleanup
+        if recognizer:
+            try:
+                recognizer.stop_continuous_recognition()
+                logger.info("Recognition stopped")
+            except:
+                pass
+        if stream:
+            try:
+                stream.close()
+                logger.info("Stream closed")
+            except:
+                pass
 
 async def main():
     logger.info("═" * 60)
-    logger.info(f"🚀 WebSocket Server Starting on Railway.app (REST API Mode)")
+    logger.info(f"🚀 WebSocket Server Starting on Railway.app")
     logger.info(f"   Host: {WS_HOST}:{WS_PORT}")
     logger.info(f"   Azure Region: {AZURE_REGION}")
     logger.info(f"   Audio: {SAMPLE_RATE}Hz, {CHANNELS} channel, 16-bit")
-    logger.info(f"   Mode: Azure REST API (Railway-compatible)")
+    logger.info(f"   Mode: Real-time continuous recognition")
     logger.info("═" * 60)
     
+    # Railway health check endpoint
     async def health_check(path, request_headers):
         if path == "/health":
             return (200, [("Content-Type", "text/plain")], b"OK")
